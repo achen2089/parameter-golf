@@ -27,6 +27,19 @@ export WANDB=${WANDB:-1}
 export WANDB_ENTITY=${WANDB_ENTITY:-anthony-chen-dev-zettabyte}
 export WANDB_PROJECT=${WANDB_PROJECT:-parameter-golf}
 
+# Auto-scale wallclock to match 8-GPU step count when running on fewer GPUs.
+# Each step is ~2x slower at 4 GPUs (grad_accum_steps=2), so to produce the same
+# number of optimizer steps as an 8-GPU 600s legal run, give 4 GPUs ~1200s.
+# Skip if user explicitly set MAX_WALLCLOCK_SECONDS.
+if [[ -z "${MAX_WALLCLOCK_SECONDS:-}" ]]; then
+  case "$NPROC" in
+    8) export MAX_WALLCLOCK_SECONDS=600  ;;
+    4) export MAX_WALLCLOCK_SECONDS=1200 ;;
+    2) export MAX_WALLCLOCK_SECONDS=2400 ;;
+    1) export MAX_WALLCLOCK_SECONDS=4800 ;;
+  esac
+fi
+
 # ---- Git sync ----
 echo "=== git pull ==="
 git pull --ff-only
@@ -47,10 +60,11 @@ fi
 
 # ---- Launch ----
 echo "=== ./main ==="
-echo "  file:    train_gpt.py"
-echo "  RUN_ID:  $RUN_ID"
-echo "  NPROC:   $NPROC"
-echo "  W&B:     $WANDB_ENTITY/$WANDB_PROJECT (WANDB=$WANDB)"
+echo "  file:        train_gpt.py"
+echo "  RUN_ID:      $RUN_ID"
+echo "  NPROC:       $NPROC"
+echo "  WALLCLOCK:   ${MAX_WALLCLOCK_SECONDS:-unset}s"
+echo "  W&B:         $WANDB_ENTITY/$WANDB_PROJECT (WANDB=$WANDB)"
 echo "==============="
 
 exec torchrun --standalone --nproc_per_node="$NPROC" train_gpt.py

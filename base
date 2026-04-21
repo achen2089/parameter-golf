@@ -26,6 +26,17 @@ export WANDB=${WANDB:-1}
 export WANDB_ENTITY=${WANDB_ENTITY:-anthony-chen-dev-zettabyte}
 export WANDB_PROJECT=${WANDB_PROJECT:-parameter-golf}
 
+# Auto-scale wallclock for sub-8-GPU runs to get the same effective training
+# as an 8-GPU 600s legal run. Skip if user explicitly set MAX_WALLCLOCK_SECONDS.
+if [[ -z "${MAX_WALLCLOCK_SECONDS:-}" ]]; then
+  case "$NPROC" in
+    8) export MAX_WALLCLOCK_SECONDS=600  ;;
+    4) export MAX_WALLCLOCK_SECONDS=1200 ;;
+    2) export MAX_WALLCLOCK_SECONDS=2400 ;;
+    1) export MAX_WALLCLOCK_SECONDS=4800 ;;
+  esac
+fi
+
 # SP1024 paths (baseline expects these explicitly)
 export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024/}
 export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}

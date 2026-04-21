@@ -150,9 +150,24 @@ See full roadmap at `~/.claude/plans/silly-launching-salamander.md`. Quick versi
 - Watch `submission_bytes` in W&B summary.
 - If over budget: tighten `MATRIX_CLIP_SIGMAS` (lower = smaller), drop `NUM_LAYERS`, or reduce `MODEL_DIM` — **not** `MAX_WALLCLOCK_SECONDS`.
 
-## Known Gotchas
+## GPU Count and Wallclock Auto-Scaling
 
-- **4-GPU wallclock is 2× the 8-GPU spec.** Quality (BPB) matches; time-legal submission must ultimately be verified on 8×H100.
+The `grad_accum_steps = 8 // world_size` math makes each **step** mathematically equivalent between 4-GPU and 8-GPU runs. But under a fixed 600s wallclock, 4 GPUs produce only **half the optimizer updates** → undertrained model → worse BPB.
+
+**Observed**: first `p1_sp8192_base` run on 4 GPUs at 600s got 2,644 steps / 1.1522 BPB vs ~6,900 steps / 1.0856 BPB expected on 8 GPUs. `train_loss` was still descending at the cap.
+
+**Fix**: `./main` and `./base` now auto-scale `MAX_WALLCLOCK_SECONDS` by NPROC:
+
+| NPROC | MAX_WALLCLOCK_SECONDS | Real wallclock | Step count equivalent to |
+|-------|----------------------:|---------------:|--------------------------|
+| 8 | 600 | 10 min | 8×H100 legal submission |
+| 4 | 1200 | 20 min | 8×H100 legal submission |
+| 2 | 2400 | 40 min | 8×H100 legal submission |
+| 1 | 4800 | 80 min | 8×H100 legal submission |
+
+Explicitly setting `MAX_WALLCLOCK_SECONDS` in env overrides auto-scaling. For **legal competition submissions** you must run on 8×H100 at 600s — these scaled proxies are quality-equivalent for iteration only.
+
+## Known Gotchas
 - **Flash Attention 3** is optional — script falls back to SDPA if `flash-attn-interface` isn't installed. Install path: `pip install flash-attn --no-build-isolation` (slow, ~10 min).
 - **Don't mix SP1024 and SP8192 runs** without confirming `VOCAB_SIZE` matches the tokenizer file on disk.
 - The reference `train_gpt.py` files in `records/track_10min_16mb/*/train_gpt.py` are LZMA+base85 compressed one-liners (code size counts toward 16MB budget). Decompress with `lzma.decompress(base64.b85decode(...))` if you need to read them.

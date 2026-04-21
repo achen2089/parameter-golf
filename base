@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# ./base — launch base_train_gpt.py (SP1024 baseline, A/B control)
+#
+# Equivalent to Master Command but for the old SP1024 baseline.
+#
+# Usage:
+#   ./base <RUN_ID>
+#   ./base base_check_1
+#   RUN_ID=base_sanity ./base
+#   NPROC=8 ./base
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# ---- RUN_ID ----
+if [[ $# -ge 1 ]]; then
+  export RUN_ID="$1"
+elif [[ -z "${RUN_ID:-}" ]]; then
+  echo "Usage: ./base <RUN_ID>  (or set RUN_ID env var)"
+  exit 1
+fi
+
+# ---- Defaults ----
+export NPROC=${NPROC:-4}
+export WANDB=${WANDB:-1}
+export WANDB_ENTITY=${WANDB_ENTITY:-anthony-chen-dev-zettabyte}
+export WANDB_PROJECT=${WANDB_PROJECT:-parameter-golf}
+
+# SP1024 paths (baseline expects these explicitly)
+export DATA_PATH=${DATA_PATH:-./data/datasets/fineweb10B_sp1024/}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}
+export VOCAB_SIZE=${VOCAB_SIZE:-1024}
+
+# ---- Git sync ----
+echo "=== git pull ==="
+git pull --ff-only
+
+# ---- Deps ----
+echo "=== pip install ==="
+pip install -q sentencepiece wandb
+
+# ---- SP1024 data (one-time) ----
+if [[ ! -d ./data/datasets/fineweb10B_sp1024 ]]; then
+  echo "=== Downloading SP1024 FineWeb data (~0.5 GB, one-time) ==="
+  python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80
+fi
+
+# ---- Launch ----
+echo "=== ./base ==="
+echo "  file:    base_train_gpt.py (SP1024 baseline)"
+echo "  RUN_ID:  $RUN_ID"
+echo "  NPROC:   $NPROC"
+echo "  W&B:     $WANDB_ENTITY/$WANDB_PROJECT (WANDB=$WANDB)"
+echo "==============="
+
+exec torchrun --standalone --nproc_per_node="$NPROC" base_train_gpt.py

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# ./main — launch train_gpt.py (SP8192 Phase N recipe)
+#
+# Equivalent to the cloud platform Master Command, wrapped for IDE use.
+# Does: git pull, pip install, download SP8192 data if missing, torchrun.
+#
+# Usage:
+#   ./main <RUN_ID>                       # positional arg sets RUN_ID
+#   ./main p1_sp8192_base
+#   RUN_ID=p2_qkg5 QK_GAIN_INIT=5.0 ./main
+#   NPROC=8 ./main                        # override default 4 GPUs
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# ---- RUN_ID ----
+if [[ $# -ge 1 ]]; then
+  export RUN_ID="$1"
+elif [[ -z "${RUN_ID:-}" ]]; then
+  echo "Usage: ./main <RUN_ID>  (or set RUN_ID env var)"
+  exit 1
+fi
+
+# ---- Defaults ----
+export NPROC=${NPROC:-4}
+export WANDB=${WANDB:-1}
+export WANDB_ENTITY=${WANDB_ENTITY:-anthony-chen-dev-zettabyte}
+export WANDB_PROJECT=${WANDB_PROJECT:-parameter-golf}
+
+# ---- Git sync ----
+echo "=== git pull ==="
+git pull --ff-only
+
+# ---- Deps ----
+echo "=== pip install ==="
+pip install -q sentencepiece wandb brotli
+
+# ---- SP8192 data (one-time) ----
+if [[ ! -d ./data/datasets/fineweb10B_sp8192 ]]; then
+  echo "=== Downloading SP8192 FineWeb data (~4-5 GB, one-time) ==="
+  MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
+    python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 128
+fi
+
+# ---- Launch ----
+echo "=== ./main ==="
+echo "  file:    train_gpt.py"
+echo "  RUN_ID:  $RUN_ID"
+echo "  NPROC:   $NPROC"
+echo "  W&B:     $WANDB_ENTITY/$WANDB_PROJECT (WANDB=$WANDB)"
+echo "==============="
+
+exec torchrun --standalone --nproc_per_node="$NPROC" train_gpt.py

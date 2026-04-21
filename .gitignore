@@ -9,3 +9,8 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+# Local decompressed SOTA references for phase-diff workflow
+refs/
+
+# Claude Code local state
+.claude/

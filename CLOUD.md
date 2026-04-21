@@ -22,11 +22,14 @@ Use **Custom Mode**:
 /bin/bash
 -c
 git pull --ff-only && \
-pip install sentencepiece wandb brotli && \
+pip install -q sentencepiece wandb brotli && \
 { [[ -d ./data/datasets/fineweb10B_sp8192 ]] || \
-  MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 128 ; } && \
+  { rm -f data/manifest.json data/datasets/manifest.json && \
+    MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 128 ; } ; } && \
 torchrun --standalone --nproc_per_node=4 train_gpt.py
 ```
+
+The `rm -f data/manifest.json` step is important: the default `willdepueoai/parameter-golf` repo doesn't have SP8192, so we need the manifest from `kevclark/parameter-golf`. If an old manifest is cached from a prior SP1024 download, the script will skip re-fetching it and fail with `dataset fineweb10B_sp8192 not found in datasets/manifest.json`. Clearing the manifest forces a fresh pull from the correct repo.
 
 **`git pull --ff-only` is critical** — without it, a duplicated job will run whatever code was on the machine at the time the snapshot was taken, not your latest commit. `--ff-only` refuses to merge if local diverges, which protects against accidents.
 

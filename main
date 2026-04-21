@@ -36,8 +36,11 @@ echo "=== pip install ==="
 pip install -q sentencepiece wandb brotli
 
 # ---- SP8192 data (one-time) ----
+# kevclark/parameter-golf has the sp8192 variant; default willdepueoai repo does not.
+# Clear any stale manifest pointing at a different repo before downloading.
 if [[ ! -d ./data/datasets/fineweb10B_sp8192 ]]; then
   echo "=== Downloading SP8192 FineWeb data (~4-5 GB, one-time) ==="
+  rm -f data/manifest.json data/datasets/manifest.json
   MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
     python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 128
 fi

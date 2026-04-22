@@ -96,6 +96,13 @@ class Hyperparameters():
     ttt_momentum = float(os.environ.get('TTT_MOMENTUM', 0.9))
     ttt_batch_seqs = int(os.environ.get('TTT_BATCH_SEQS', 32))
     ttt_grad_clip = float(os.environ.get('TTT_GRAD_CLIP', 1.0))
+    # Retrieval-augmented TTT: during each chunk's training phase, replay a
+    # fraction of batches from earlier chunks (experience replay) to prevent
+    # the model from catastrophically forgetting as it adapts chunk-by-chunk.
+    # 0.0 disables (pure on-chunk). 0.5 = half batches replayed from prior.
+    # retrieval_mode: 0=uniform random over prior chunks, 1=recency-weighted.
+    ttt_replay_frac = float(os.environ.get('TTT_REPLAY_FRAC', 0.0))
+    ttt_retrieval_mode = int(os.environ.get('TTT_RETRIEVAL_MODE', 0))
 
     # Optimizer
     min_lr = float(os.environ.get('MIN_LR', 0.0))
@@ -1287,6 +1294,12 @@ def eval_val_sliding_ttt(h: Hyperparameters, base_model: nn.Module, rank: int,
     t0 = time.perf_counter()
     batch_seqs = h.ttt_batch_seqs
 
+    # Prior chunk seq-start offsets (token positions in val_tokens) across all
+    # chunks already trained on — strictly causal, populated after each chunk.
+    # Used by retrieval-augmented TTT (ttt_replay_frac > 0) to sample replay batches.
+    prior_seq_starts: list[int] = []
+    replay_rng = random.Random(h.seed + 9001 + rank)  # per-rank deterministic
+
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
         if not windows:
@@ -1347,28 +1360,52 @@ def eval_val_sliding_ttt(h: Hyperparameters, base_model: nn.Module, rank: int,
                 my_seq_s = chunk_seqs * rank // world_size
                 my_seq_e = chunk_seqs * (rank + 1) // world_size
                 my_chunk_seqs = my_seq_e - my_seq_s
+
+                def _run_batch(start_tok: int, num_seqs: int) -> None:
+                    end_tok = start_tok + num_seqs * seq_len + 1
+                    if end_tok > val_data.val_tokens.numel():
+                        return
+                    local = val_data.val_tokens[start_tok:end_tok].to(
+                        device=device, dtype=torch.int64)
+                    x = local[:-1].reshape(-1, seq_len)
+                    y = local[1:].reshape(-1, seq_len)
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        loss = base_model(x, y)
+                    loss.backward()
+                    if world_size > 1:
+                        for p in ttt_params:
+                            if p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
+                    optimizer.step()
+
                 for _ep in range(h.ttt_epochs):
                     for bs in range(0, my_chunk_seqs, batch_seqs):
                         be = min(bs + batch_seqs, my_chunk_seqs)
+                        nseq = be - bs
                         actual_bs = my_seq_s + bs
                         start_tok = chunk_start + actual_bs * seq_len
-                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                        if end_tok > val_data.val_tokens.numel():
-                            continue
-                        local = val_data.val_tokens[start_tok:end_tok].to(
-                            device=device, dtype=torch.int64)
-                        x = local[:-1].reshape(-1, seq_len)
-                        y = local[1:].reshape(-1, seq_len)
-                        optimizer.zero_grad(set_to_none=True)
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            loss = base_model(x, y)
-                        loss.backward()
-                        if world_size > 1:
-                            for p in ttt_params:
-                                if p.grad is not None:
-                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
-                        optimizer.step()
+                        _run_batch(start_tok, nseq)
+
+                        # Retrieval-augmented step: with probability replay_frac,
+                        # sample an additional batch from prior chunk seq starts.
+                        if (h.ttt_replay_frac > 0.0
+                                and prior_seq_starts
+                                and replay_rng.random() < h.ttt_replay_frac):
+                            if h.ttt_retrieval_mode == 1:
+                                # Recency-weighted: more recent chunks more likely
+                                idx = int(len(prior_seq_starts) * (1.0 - replay_rng.random() ** 2))
+                                idx = min(max(idx, 0), len(prior_seq_starts) - 1)
+                            else:
+                                idx = replay_rng.randrange(len(prior_seq_starts))
+                            replay_start = prior_seq_starts[idx]
+                            _run_batch(replay_start, nseq)
+
+                # Remember this chunk's sequence starts for future replay batches.
+                for bs in range(0, my_chunk_seqs, batch_seqs):
+                    actual_bs = my_seq_s + bs
+                    prior_seq_starts.append(chunk_start + actual_bs * seq_len)
 
         if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
             elapsed = time.perf_counter() - t0

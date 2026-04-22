@@ -14,3 +14,7 @@ refs/
 
 # Claude Code local state
 .claude/
+
+# train_gpt.py is derived from train_gpt_human.py via build_train_gpt.py
+# Regenerate with `python3 build_train_gpt.py` before running.
+train_gpt.py

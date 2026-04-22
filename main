@@ -48,6 +48,11 @@ git pull --ff-only
 echo "=== pip install ==="
 pip install -q sentencepiece wandb brotli
 
+# ---- Build compressed train_gpt.py from train_gpt_human.py ----
+# code_bytes counts toward the 16MB limit; LZMA+b85 wrapping cuts it ~70%.
+echo "=== build_train_gpt.py ==="
+python3 build_train_gpt.py
+
 # ---- SP8192 data (one-time) ----
 # kevclark/parameter-golf has the sp8192 variant; default willdepueoai repo does not.
 # Clear any stale manifest pointing at a different repo before downloading.

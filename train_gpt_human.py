@@ -1297,8 +1297,12 @@ def eval_val_sliding_ttt(h: Hyperparameters, base_model: nn.Module, rank: int,
     # Prior chunk seq-start offsets (token positions in val_tokens) across all
     # chunks already trained on — strictly causal, populated after each chunk.
     # Used by retrieval-augmented TTT (ttt_replay_frac > 0) to sample replay batches.
+    # CRITICAL: the decision RNG must be shared across ranks so every rank makes
+    # the same replay yes/no choice, otherwise ranks fall out of sync on NCCL
+    # collectives and the run hangs. The per-rank index choice can differ.
     prior_seq_starts: list[int] = []
-    replay_rng = random.Random(h.seed + 9001 + rank)  # per-rank deterministic
+    decision_rng = random.Random(h.seed + 9001)       # shared across ranks
+    idx_rng = random.Random(h.seed + 9001 + rank)     # per-rank sampling
 
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
@@ -1390,15 +1394,16 @@ def eval_val_sliding_ttt(h: Hyperparameters, base_model: nn.Module, rank: int,
 
                         # Retrieval-augmented step: with probability replay_frac,
                         # sample an additional batch from prior chunk seq starts.
-                        if (h.ttt_replay_frac > 0.0
-                                and prior_seq_starts
-                                and replay_rng.random() < h.ttt_replay_frac):
+                        # decision_rng is shared across ranks (keeps collective
+                        # counts identical). idx_rng is per-rank (diverse data).
+                        do_replay = (h.ttt_replay_frac > 0.0
+                                     and decision_rng.random() < h.ttt_replay_frac)
+                        if do_replay and prior_seq_starts:
                             if h.ttt_retrieval_mode == 1:
-                                # Recency-weighted: more recent chunks more likely
-                                idx = int(len(prior_seq_starts) * (1.0 - replay_rng.random() ** 2))
+                                idx = int(len(prior_seq_starts) * (1.0 - idx_rng.random() ** 2))
                                 idx = min(max(idx, 0), len(prior_seq_starts) - 1)
                             else:
-                                idx = replay_rng.randrange(len(prior_seq_starts))
+                                idx = idx_rng.randrange(len(prior_seq_starts))
                             replay_start = prior_seq_starts[idx]
                             _run_batch(replay_start, nseq)
 

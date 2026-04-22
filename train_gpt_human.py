@@ -82,6 +82,21 @@ class Hyperparameters():
     loop_end = int(os.environ.get('LOOP_END', 5))
     enable_looping_at = float(os.environ.get('ENABLE_LOOPING_AT', 0.5))
 
+    # Parallel residuals (dual-lane attn/mlp from layer N onward). 0 disables.
+    parallel_start_layer = int(os.environ.get('PARALLEL_START_LAYER', 0))
+
+    # Legal Score-First Test-Time Training (TTT).
+    # Post-training: score each 32K-token chunk in no_grad, then SGD-train on the
+    # same chunk before scoring the next. Causal, single-pass, score-before-update.
+    ttt_enabled = bool(int(os.environ.get('TTT_ENABLED', 0)))
+    ttt_lr = float(os.environ.get('TTT_LR', 0.005))
+    ttt_epochs = int(os.environ.get('TTT_EPOCHS', 3))
+    ttt_chunk_tokens = int(os.environ.get('TTT_CHUNK_TOKENS', 32768))
+    ttt_freeze_blocks = int(os.environ.get('TTT_FREEZE_BLOCKS', 0))
+    ttt_momentum = float(os.environ.get('TTT_MOMENTUM', 0.9))
+    ttt_batch_seqs = int(os.environ.get('TTT_BATCH_SEQS', 32))
+    ttt_grad_clip = float(os.environ.get('TTT_GRAD_CLIP', 1.0))
+
     # Optimizer
     min_lr = float(os.environ.get('MIN_LR', 0.0))
     embed_lr = float(os.environ.get('EMBED_LR', 0.6))
@@ -478,6 +493,16 @@ class Block(nn.Module):
             self.mlp_norm(x_out) * self.ln_scale_factor)
         return x_out
 
+    def forward_attn(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
+        return x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+
+    def forward_mlp(self, x: Tensor) -> Tensor:
+        return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(
+            self.mlp_norm(x) * self.ln_scale_factor)
+
 
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
@@ -532,6 +557,15 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
 
+        # Parallel residuals: when active (parallel_start_layer > 0), decoder layers
+        # from index psl onward run attn and mlp on separate lanes that merge at the
+        # end via a sigmoid-gated scalar. Layers before psl use standard flow.
+        self.parallel_start_layer = h.parallel_start_layer
+        self.lane_merge = (
+            nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+            if self.parallel_start_layer > 0 else None
+        )
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -557,15 +591,39 @@ class GPT(nn.Module):
         for i in enc_iter:
             x = self.blocks[i](x, x0)
             skips.append(x)
+        psl = self.parallel_start_layer
+        lane0: Tensor | None = None  # attn lane
+        lane1: Tensor | None = None  # mlp lane
         for skip_idx, i in enumerate(dec_iter):
-            if skip_idx < self.num_skip_weights and skips:
-                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
-                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
-                    x = torch.lerp(scaled_skip, x, g)
+            if lane0 is None:
+                # Single-lane path (layers before psl)
+                if skip_idx < self.num_skip_weights and skips:
+                    scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    if self.skip_gates is not None:
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                        x = torch.lerp(scaled_skip, x, g)
+                    else:
+                        x = x + scaled_skip
+                if psl > 0 and i >= psl:
+                    # Enter dual-lane: both lanes start from current x
+                    lane0 = self.blocks[i].forward_attn(x, x0)
+                    lane1 = self.blocks[i].forward_mlp(x.clone())
                 else:
-                    x = x + scaled_skip
-            x = self.blocks[i](x, x0)
+                    x = self.blocks[i](x, x0)
+            else:
+                # Dual-lane path (skips mutate lane0 only; lane1 flows unsliced)
+                if skip_idx < self.num_skip_weights and skips:
+                    scaled_skip = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :] * skips.pop()
+                    if self.skip_gates is not None:
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=lane0.dtype))[None, None, :]
+                        lane0 = torch.lerp(scaled_skip, lane0, g)
+                    else:
+                        lane0 = lane0 + scaled_skip
+                lane0 = self.blocks[i].forward_attn(lane0, x0)
+                lane1 = self.blocks[i].forward_mlp(lane1)
+        if lane0 is not None and lane1 is not None:
+            lm = self.lane_merge.to(dtype=lane0.dtype)
+            x = lm * lane0 + (1.0 - lm) * lane1
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -674,7 +732,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,lane_merge",
     ).split(",")
     if pattern
 )
@@ -699,6 +757,8 @@ class Optimizers():
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
+        if base_model.lane_merge is not None:
+            scalar_params.append(base_model.lane_merge)
 
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1169,6 +1229,170 @@ def eval_val_sliding(
     return _loss_bpb(loss_sum, token_count, byte_count)
 
 
+def eval_val_sliding_ttt(h: Hyperparameters, base_model: nn.Module, rank: int,
+                         world_size: int, device: torch.device,
+                         val_data: "ValidationData", stride: int) -> tuple[float, float]:
+    """Legal Score-First Test-Time Training.
+
+    Partition val into chunks of TTT_CHUNK_TOKENS. For each chunk:
+      1. Score all sliding windows in no_grad — counts toward BPB.
+      2. If not the final chunk, SGD-train on that chunk (causal, single-pass).
+    The next chunk is scored with the adapted weights. No token is rescored.
+    """
+    seq_len = h.eval_seq_len
+    total_tokens = val_data.val_tokens.numel() - 1
+    ttt_chunk = h.ttt_chunk_tokens
+    context_size = seq_len - stride
+
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if ws + context_size < total_tokens
+    ]
+    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
+    chunk_windows: list[list[int]] = [[] for _ in range(num_chunks)]
+    for ws in window_starts:
+        end = min(ws + seq_len, total_tokens)
+        wlen = end - ws
+        s = 0 if ws == 0 else context_size
+        scored_start = ws + s
+        ci = min(scored_start // ttt_chunk, num_chunks - 1)
+        chunk_windows[ci].append(ws)
+
+    log(
+        f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
+        f"total_windows={len(window_starts)} stride={stride} ttt_lr={h.ttt_lr} "
+        f"ttt_epochs={h.ttt_epochs} freeze_blocks={h.ttt_freeze_blocks}"
+    )
+
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    frozen_block_ids = set(range(min(h.ttt_freeze_blocks, len(base_model.blocks))))
+    ttt_params: list[Tensor] = []
+    for name, p in base_model.named_parameters():
+        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+        if freeze:
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(True)
+            ttt_params.append(p)
+    log(
+        f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
+        f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}"
+    )
+
+    optimizer = torch.optim.SGD(ttt_params, lr=h.ttt_lr, momentum=h.ttt_momentum)
+    t0 = time.perf_counter()
+    batch_seqs = h.ttt_batch_seqs
+
+    for ci in range(num_chunks):
+        windows = chunk_windows[ci]
+        if not windows:
+            continue
+        chunk_start = ci * ttt_chunk
+        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+
+        # Partition windows across ranks for scoring
+        my_s = len(windows) * rank // world_size
+        my_e = len(windows) * (rank + 1) // world_size
+        my_windows = windows[my_s:my_e]
+
+        # PHASE 1: score under no_grad (legal: no weight updates touch model)
+        base_model.eval()
+        with torch.no_grad():
+            for bi in range(0, len(my_windows), batch_seqs):
+                batch_ws = my_windows[bi:bi + batch_seqs]
+                bsz = len(batch_ws)
+                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                wlens: list[int] = []
+                for i, ws in enumerate(batch_ws):
+                    end = min(ws + seq_len, total_tokens)
+                    wlen = end - ws
+                    wlens.append(wlen)
+                    chunk_tok = val_data.val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                    x_batch[i, :wlen] = chunk_tok[:-1]
+                    y_batch[i, :wlen] = chunk_tok[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = compiled_logits(x_batch)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = 0 if ws == 0 else context_size
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt = y_batch[i, s:wlen]
+                    prev = x_batch[i, s:wlen]
+                    tb = val_data.base_bytes_lut[tgt].to(torch.float64)
+                    tb += (val_data.has_leading_space_lut[tgt]
+                           & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
+
+        # PHASE 2: SGD adaptation on this chunk's data (skip for last chunk)
+        is_last_chunk = ci == num_chunks - 1
+        if not is_last_chunk and h.ttt_epochs > 0:
+            base_model.train()
+            chunk_seqs = (chunk_end - chunk_start) // seq_len
+            if chunk_seqs > 0:
+                cos_lr = h.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in optimizer.param_groups:
+                    pg["lr"] = cos_lr
+                my_seq_s = chunk_seqs * rank // world_size
+                my_seq_e = chunk_seqs * (rank + 1) // world_size
+                my_chunk_seqs = my_seq_e - my_seq_s
+                for _ep in range(h.ttt_epochs):
+                    for bs in range(0, my_chunk_seqs, batch_seqs):
+                        be = min(bs + batch_seqs, my_chunk_seqs)
+                        actual_bs = my_seq_s + bs
+                        start_tok = chunk_start + actual_bs * seq_len
+                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
+                        if end_tok > val_data.val_tokens.numel():
+                            continue
+                        local = val_data.val_tokens[start_tok:end_tok].to(
+                            device=device, dtype=torch.int64)
+                        x = local[:-1].reshape(-1, seq_len)
+                        y = local[1:].reshape(-1, seq_len)
+                        optimizer.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            loss = base_model(x, y)
+                        loss.backward()
+                        if world_size > 1:
+                            for p in ttt_params:
+                                if p.grad is not None:
+                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        torch.nn.utils.clip_grad_norm_(ttt_params, h.ttt_grad_clip)
+                        optimizer.step()
+
+        if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
+            elapsed = time.perf_counter() - t0
+            rl = loss_sum.item() / max(token_count.item(), 1)
+            rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1))
+            log(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+    base_model.eval()
+    log(
+        f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
+        f"elapsed={time.perf_counter()-t0:.1f}s"
+    )
+    return val_loss, val_bpb
+
+
 def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1392,9 +1616,29 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     if h.sliding_window_enabled:
         sw_loss, sw_bpb = timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
 
+    ttt_loss = ttt_bpb = None
+    if h.ttt_enabled:
+        # Deserialize a fresh model for TTT (compiled eval_model is stateful).
+        del eval_model, compiled_model
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
+        ttt_model = deserialize(h, device)
+        if h.num_loops > 0:
+            ttt_model.looping_active = True
+        ttt_loss, ttt_bpb = timed_eval(
+            "legal_ttt_exact", eval_val_sliding_ttt,
+            h, ttt_model, h.rank, h.world_size, device, val_data, h.eval_stride,
+        )
+        del ttt_model
+
     if h.is_main_process and h.use_wandb and wandb is not None:
-        final_loss = sw_loss if sw_loss is not None else q_loss
-        final_bpb = sw_bpb if sw_bpb is not None else q_bpb
+        # Final BPB preference: TTT > sliding window > plain quantized
+        if ttt_bpb is not None:
+            final_loss, final_bpb = ttt_loss, ttt_bpb
+        elif sw_bpb is not None:
+            final_loss, final_bpb = sw_loss, sw_bpb
+        else:
+            final_loss, final_bpb = q_loss, q_bpb
         summary = {
             'pre_quant_val_loss': pre_loss, 'pre_quant_val_bpb': pre_bpb,
             'quantized_val_loss': q_loss, 'quantized_val_bpb': q_bpb,
@@ -1404,6 +1648,9 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
         if sw_loss is not None:
             summary['sliding_val_loss'] = sw_loss
             summary['sliding_val_bpb'] = sw_bpb
+        if ttt_loss is not None:
+            summary['ttt_val_loss'] = ttt_loss
+            summary['ttt_val_bpb'] = ttt_bpb
         for k, v in summary.items():
             wandb.summary[k] = v
         wandb.finish()

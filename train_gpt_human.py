@@ -85,6 +85,13 @@ class Hyperparameters():
     # Parallel residuals (dual-lane attn/mlp from layer N onward). 0 disables.
     parallel_start_layer = int(os.environ.get('PARALLEL_START_LAYER', 0))
 
+    # MoE MLP: comma-separated list of layer indices whose MLP gets replaced
+    # with a K-expert MoE MLP of the same total param count (each expert has
+    # hidden = mlp_mult * dim / K). Budget-neutral — only adds a tiny
+    # K-way router per replaced layer (~1KB params at typical K).
+    moe_mlp_layers = os.environ.get('MOE_MLP_LAYERS', '')
+    moe_mlp_experts = int(os.environ.get('MOE_MLP_EXPERTS', 4))
+
     # Legal Score-First Test-Time Training (TTT).
     # Post-training: score each 32K-token chunk in no_grad, then SGD-train on the
     # same chunk before scoring the next. Causal, single-pass, score-before-update.
@@ -469,16 +476,56 @@ class MLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 
+class MoEMLP(nn.Module):
+    """Budget-neutral MoE MLP: K experts, each 1/K the size of a regular MLP.
+
+    Total fc+proj params equal a regular MLP (num_experts * (mlp_mult * dim / K)
+    per direction). Extra router: dim * num_experts, negligible. Soft routing
+    (weighted sum over all experts), which is dense in compute but stable and
+    requires no load-balancing loss.
+    """
+    def __init__(self, dim: int, mlp_mult: int, num_experts: int):
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError("MoEMLP num_experts must be positive")
+        hidden = int(mlp_mult * dim) // num_experts
+        if hidden <= 0:
+            raise ValueError(f"MoE expert hidden={hidden} invalid for mlp_mult={mlp_mult} dim={dim} K={num_experts}")
+        self.num_experts = num_experts
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        self.experts_fc = nn.ModuleList([
+            CastedLinear(dim, hidden, bias=False) for _ in range(num_experts)
+        ])
+        self.experts_proj = nn.ModuleList([
+            CastedLinear(hidden, dim, bias=False) for _ in range(num_experts)
+        ])
+        for proj in self.experts_proj:
+            proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        router_weights = F.softmax(self.router(x), dim=-1)  # [B, T, K]
+        outputs = []
+        for k in range(self.num_experts):
+            h = F.leaky_relu(self.experts_fc[k](x), negative_slope=0.5).square()
+            outputs.append(self.experts_proj[k](h))
+        stacked = torch.stack(outputs, dim=-2)  # [B, T, K, D]
+        return (stacked * router_weights.unsqueeze(-1)).sum(dim=-2)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  rope_base: float, qk_gain_init: float, train_seq_len: int,
-                 layer_idx: int = 0, ln_scale: bool = False):
+                 layer_idx: int = 0, ln_scale: bool = False,
+                 use_moe_mlp: bool = False, moe_experts: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
             dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len)
-        self.mlp = MLP(dim, mlp_mult)
+        if use_moe_mlp and moe_experts > 0:
+            self.mlp = MoEMLP(dim, mlp_mult, moe_experts)
+        else:
+            self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -521,9 +568,13 @@ class GPT(nn.Module):
             self.head_proj = None
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
+        moe_layer_set = {
+            int(s) for s in h.moe_mlp_layers.split(',') if s.strip().isdigit()
+        }
         self.blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
-                  h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale)
+                  h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale,
+                  use_moe_mlp=(i in moe_layer_set), moe_experts=h.moe_mlp_experts)
             for i in range(h.num_layers)
         ])
         if h.rope_dims > 0:
@@ -759,6 +810,9 @@ class Optimizers():
             scalar_params.append(base_model.skip_gates)
         if base_model.lane_merge is not None:
             scalar_params.append(base_model.lane_merge)
+        # Note: MoEMLP weights live under base_model.blocks and are picked up
+        # automatically by block_named_params above (router/experts_fc/experts_proj
+        # are all CastedLinear modules with 2D weights -> matrix_params via Muon).
 
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]

@@ -1106,9 +1106,13 @@ def eval_val(
     h: Hyperparameters,
     device: torch.device,
     val_data: ValidationData,
-    model: nn.Module
+    model: nn.Module,
+    seq_len_override: int | None = None,
 ) -> tuple[float, float]:
-    seq_len = h.eval_seq_len
+    # seq_len_override lets the periodic in-training eval use train_seq_len
+    # (matches the training-compiled graph's shape) while post-training eval
+    # falls through to the default h.eval_seq_len.
+    seq_len = seq_len_override if seq_len_override is not None else h.eval_seq_len
     local_batch_tokens = h.val_batch_tokens // (h.world_size * h.grad_accum_steps)
     if local_batch_tokens < seq_len:
         raise ValueError(
@@ -1511,7 +1515,8 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(h, device, val_data, model)
+            # Match the training-compiled graph's shape to avoid recompile
+            val_loss, val_bpb = eval_val(h, device, val_data, model, seq_len_override=h.train_seq_len)
             log(f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}")
             if h.is_main_process and h.use_wandb and wandb is not None:
                 wandb.log({'val_loss': val_loss, 'val_bpb': val_bpb,

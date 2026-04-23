@@ -1628,8 +1628,8 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
 
     ttt_loss = ttt_bpb = None
     if h.ttt_enabled:
-        # Deserialize a fresh model for TTT (compiled eval_model is stateful).
-        del eval_model, compiled_model
+        # Free the previous eval model before deserializing a fresh one for TTT.
+        del eval_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)

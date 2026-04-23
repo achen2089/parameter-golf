@@ -1163,7 +1163,7 @@ def eval_val_sliding(
     batch_seqs: int = 32
 ) -> tuple[float, float]:
     base_model.eval()
-    logits_fn = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    logits_fn = torch.compile(base_model.forward_logits, dynamic=True, fullgraph=True)
 
     seq_len = h.eval_seq_len
     context_size = seq_len - h.eval_stride
@@ -1264,7 +1264,7 @@ def eval_val_sliding_ttt(h: Hyperparameters, base_model: nn.Module, rank: int,
         f"ttt_epochs={h.ttt_epochs} freeze_blocks={h.ttt_freeze_blocks}"
     )
 
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=True, fullgraph=True)
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1599,8 +1599,11 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     log(f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}")
     log(f"val_tokens: {val_data.val_tokens.numel() - 1}")
 
-    base_model, compiled_model = train_model(h, device, val_data)
+    base_model, _train_compiled = train_model(h, device, val_data)
     torch._dynamo.reset()
+    # Recompile with dynamic=True so eval can accept EVAL_SEQ_LEN != TRAIN_SEQ_LEN
+    # without hitting the fullgraph=True recompile limit.
+    compiled_model = torch.compile(base_model, dynamic=True, fullgraph=True)
     pre_loss, pre_bpb = timed_eval("pre-quantization post-ema", eval_val, h, device, val_data, compiled_model)
 
     bytes_total, quant_file_bytes = serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
@@ -1610,7 +1613,7 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     if h.num_loops > 0:
         eval_model.looping_active = True
 
-    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(eval_model, dynamic=True, fullgraph=True)
     q_loss, q_bpb = timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
     sw_loss = sw_bpb = None
     if h.sliding_window_enabled:

@@ -1167,8 +1167,7 @@ def eval_val_sliding(
     batch_seqs: int = 32
 ) -> tuple[float, float]:
     base_model.eval()
-    # Eager forward_logits to avoid dynamic-shape compile bugs at EVAL_SEQ_LEN.
-    logits_fn = base_model.forward_logits
+    logits_fn = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
 
     seq_len = h.eval_seq_len
     context_size = seq_len - h.eval_stride
@@ -1269,8 +1268,7 @@ def eval_val_sliding_ttt(h: Hyperparameters, base_model: nn.Module, rank: int,
         f"ttt_epochs={h.ttt_epochs} freeze_blocks={h.ttt_freeze_blocks}"
     )
 
-    # Eager forward_logits for TTT too (same reason).
-    compiled_logits = base_model.forward_logits
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1606,12 +1604,9 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     log(f"train_shards: {len(list(Path(h.datasets_dir).resolve().glob('fineweb_train_*.bin')))}")
     log(f"val_tokens: {val_data.val_tokens.numel() - 1}")
 
-    base_model, _train_compiled = train_model(h, device, val_data)
+    base_model, compiled_model = train_model(h, device, val_data)
     torch._dynamo.reset()
-    # Eager mode (no torch.compile) for post-training eval. Slightly slower but
-    # robust to shape variation (EVAL_SEQ_LEN != TRAIN_SEQ_LEN) and avoids known
-    # PyTorch inductor bugs around dynamic=True + fullgraph=True on this graph.
-    pre_loss, pre_bpb = timed_eval("pre-quantization post-ema", eval_val, h, device, val_data, base_model)
+    pre_loss, pre_bpb = timed_eval("pre-quantization post-ema", eval_val, h, device, val_data, compiled_model)
 
     bytes_total, quant_file_bytes = serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     if h.distributed:
@@ -1620,16 +1615,16 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     if h.num_loops > 0:
         eval_model.looping_active = True
 
-    # Eager mode for quantized eval too — same rationale (robust to EVAL_SEQ_LEN).
-    q_loss, q_bpb = timed_eval("quantized", eval_val, h, device, val_data, eval_model)
+    compiled_model = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    q_loss, q_bpb = timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
     sw_loss = sw_bpb = None
     if h.sliding_window_enabled:
         sw_loss, sw_bpb = timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
 
     ttt_loss = ttt_bpb = None
     if h.ttt_enabled:
-        # Free the previous eval model before deserializing a fresh one for TTT.
-        del eval_model
+        # Deserialize a fresh model for TTT (compiled eval_model is stateful).
+        del eval_model, compiled_model
         torch._dynamo.reset()
         torch.cuda.empty_cache()
         ttt_model = deserialize(h, device)

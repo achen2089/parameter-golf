@@ -1591,8 +1591,12 @@ def eval_val_ttt_lora(h: Hyperparameters, base_model: "GPT", rank: int,
     lora_rank = h.ttt_lora_rank
 
     docs = _find_docs_by_bos(val_data.val_tokens)
-    log(f"ttt_lora:start docs={len(docs)} rank={lora_rank} chunk={chunk_size} "
-        f"seq_len={eval_seq_len} batch={batch_size}")
+    avg_dl = sum(d[1] for d in docs) / max(len(docs), 1)
+    log(f"ttt_lora:start docs={len(docs)} avg_doc_len={avg_dl:.1f} "
+        f"rank={lora_rank} chunk={chunk_size} seq_len={eval_seq_len} batch={batch_size}")
+    if len(docs) < 100:
+        log(f"ttt_lora:WARNING only {len(docs)} docs — BOS_ID={BOS_ID} may be wrong "
+            f"for this tokenizer; LoRA TTT will not be doc-isolated")
 
     # Each rank gets a contiguous slice of documents.
     rank_docs = docs[(len(docs) * rank) // world_size:

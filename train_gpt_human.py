@@ -92,6 +92,22 @@ class Hyperparameters():
     moe_mlp_layers = os.environ.get('MOE_MLP_LAYERS', '')
     moe_mlp_experts = int(os.environ.get('MOE_MLP_EXPERTS', 4))
 
+    # Universal Transformer / tied blocks. 0 disables (current behavior).
+    # When 0 < N < num_layers, only N unique Block instances are created and
+    # reused across the num_layers virtual positions. Frees substantial param
+    # budget in the byte-constrained regime. Composes with depth recurrence
+    # (LOOP_*) and parallel residuals (PARALLEL_START_LAYER).
+    num_unique_blocks = int(os.environ.get('NUM_UNIQUE_BLOCKS', 0))
+    # 'cyclic' (default): virtual i -> unique[i % N]. 'block': contiguous groups.
+    ut_tie_pattern = os.environ.get('UT_TIE_PATTERN', 'cyclic')
+    # Shared blocks see N× more gradient — scale matrix LR down for them.
+    # Literature-informed defaults from RRT (arxiv 2410.20672) suggest 0.5-0.8.
+    ut_lr_scale = float(os.environ.get('UT_LR_SCALE', 0.5))
+    # Init shrink for shared blocks: literature suggests ~1/sqrt(N) for stability
+    # of N-fold weight sharing. 0.0 disables (no shrink); >0 multiplies init by
+    # this factor for the unique blocks only.
+    ut_init_shrink = float(os.environ.get('UT_INIT_SHRINK', 0.0))
+
     # Legal Score-First Test-Time Training (TTT).
     # Post-training: score each 32K-token chunk in no_grad, then SGD-train on the
     # same chunk before scoring the next. Causal, single-pass, score-before-update.
@@ -551,6 +567,37 @@ class Block(nn.Module):
             self.mlp_norm(x) * self.ln_scale_factor)
 
 
+class _BlockProxy(nn.Module):
+    """Indexed access to unique Block instances by virtual layer position.
+
+    When Universal-Transformer-style sharing is active, the actual `nn.ModuleList`
+    holds only `num_unique_blocks` instances. This proxy maps each virtual
+    position (0..num_layers-1) to a unique block via `virtual_to_unique[i]`.
+    Subclasses `nn.Module` so PyTorch tracks parameters via `self.unique`.
+
+    Identity case: when `len(unique) == len(virtual_to_unique)` and the mapping
+    is the identity, behavior is bit-equivalent to a plain `nn.ModuleList`.
+    """
+    def __init__(self, unique_blocks: nn.ModuleList, virtual_to_unique: list[int]):
+        super().__init__()
+        self.unique = unique_blocks
+        # Store mapping as a buffer-free Python list so it doesn't pollute state_dict.
+        self._mapping = list(virtual_to_unique)
+
+    def __getitem__(self, i: int):
+        return self.unique[self._mapping[i]]
+
+    def __len__(self) -> int:
+        return len(self._mapping)
+
+    def __iter__(self):
+        for m in self._mapping:
+            yield self.unique[m]
+
+    def num_unique(self) -> int:
+        return len(self.unique)
+
+
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
@@ -571,15 +618,33 @@ class GPT(nn.Module):
         moe_layer_set = {
             int(s) for s in h.moe_mlp_layers.split(',') if s.strip().isdigit()
         }
-        self.blocks = nn.ModuleList([
+        # Universal-Transformer-style block sharing. When num_unique_blocks is in
+        # (0, num_layers), only that many unique Block instances are created and
+        # reused at multiple virtual layer positions.
+        nub = h.num_unique_blocks
+        n_unique = nub if 0 < nub < h.num_layers else h.num_layers
+        self.ut_active = (n_unique < h.num_layers)
+        self.n_unique = n_unique
+        unique_blocks = nn.ModuleList([
             Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult, h.rope_base,
                   h.qk_gain_init, h.train_seq_len, layer_idx=i, ln_scale=h.ln_scale,
-                  use_moe_mlp=(i in moe_layer_set), moe_experts=h.moe_mlp_experts)
-            for i in range(h.num_layers)
+                  use_moe_mlp=(False if self.ut_active else (i in moe_layer_set)),
+                  moe_experts=(0 if self.ut_active else h.moe_mlp_experts))
+            for i in range(n_unique)
         ])
+        # Build virtual→unique mapping. ln_scale_factor is a per-instance attribute
+        # tied to the block's layer_idx. With sharing, the unique block's
+        # ln_scale_factor is fixed at its layer_idx, but it may be applied at
+        # multiple virtual positions. This is a mild approximation.
+        if h.ut_tie_pattern == 'block':
+            grp = (h.num_layers + n_unique - 1) // n_unique
+            virtual_to_unique = [min(i // grp, n_unique - 1) for i in range(h.num_layers)]
+        else:  # 'cyclic' default
+            virtual_to_unique = [i % n_unique for i in range(h.num_layers)]
+        self.blocks = _BlockProxy(unique_blocks, virtual_to_unique)
         if h.rope_dims > 0:
             head_dim = h.model_dim // h.num_heads
-            for block in self.blocks:
+            for block in unique_blocks:
                 block.attn.rope_dims = h.rope_dims
                 block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
         self.final_norm = RMSNorm()
@@ -617,6 +682,13 @@ class GPT(nn.Module):
             if self.parallel_start_layer > 0 else None
         )
 
+        # UT init shrink — used by _init_weights to scale shared block linear
+        # layer weights. 0 disables. When ut_init_shrink == 0 and UT is active,
+        # auto-set to 1/sqrt(num_layers / n_unique) per literature recommendation.
+        self._ut_init_shrink = h.ut_init_shrink
+        if self._ut_init_shrink == 0.0 and self.ut_active:
+            self._ut_init_shrink = (h.num_layers / max(self.n_unique, 1)) ** -0.5
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -629,6 +701,16 @@ class GPT(nn.Module):
                 elif (module.weight.ndim == 2 and module.weight.shape[0] >= 64 and
                       module.weight.shape[1] >= 64):
                     nn.init.orthogonal_(module.weight, gain=1.0)
+        # UT init shrink: scale shared block weights down so the cumulative effect
+        # of N applications doesn't blow up. Applied only to Linear layers inside
+        # the unique blocks (not to embeddings/skip_weights/etc).
+        ut_shrink = getattr(self, '_ut_init_shrink', 0.0)
+        if ut_shrink > 0.0:
+            for block in self.blocks.unique:
+                for module in block.modules():
+                    if isinstance(module, nn.Linear) and not getattr(module, '_zero_init', False):
+                        with torch.no_grad():
+                            module.weight.mul_(ut_shrink)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -823,16 +905,21 @@ class Optimizers():
             weight_decay=h.embed_wd,
             fused=True,
         )
+        # Universal Transformer LR scaling: shared block weights see N× more
+        # gradient than non-shared blocks (where N = num_layers / n_unique).
+        # Scale matrix LR down by ut_lr_scale (default 0.5) to compensate.
+        ut_active = getattr(base_model, 'ut_active', False)
+        muon_lr = h.matrix_lr * (h.ut_lr_scale if ut_active else 1.0)
         self.optimizer_muon = Muon(
             matrix_params,
-            lr=h.matrix_lr,
+            lr=muon_lr,
             momentum=h.muon_momentum,
             backend_steps=h.muon_backend_steps,
             weight_decay=h.muon_wd,
             row_normalize=h.muon_row_normalize,
         )
         for group in self.optimizer_muon.param_groups:
-            group["base_lr"] = h.matrix_lr
+            group["base_lr"] = muon_lr
         self.optimizer_scalar = torch.optim.AdamW(
             [{"params": scalar_params, "lr": h.scalar_lr, "base_lr": h.scalar_lr}],
             betas=(h.beta1, h.beta2),
